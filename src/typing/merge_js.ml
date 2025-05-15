@@ -481,43 +481,122 @@ let check_general_post_inference_validations cx =
 
 let check_react_rules cx tast = React_rules.check_react_rules cx tast
 
-let check_haste_provider_conflict cx =
+let check_haste_provider_conflict cx tast =
   let metadata = Context.metadata cx in
   let file_options = metadata.Context.file_options in
   let filename = Context.file cx in
-  (* Suppose we have the setup of web project, native project, and web+native common code project.
-   * We want to emit the same kinds of Haste module provider conflict error as if the same set of
-   * code is covered by two flowconfigs.
-   * (one include web only + common, one include native only + common) *)
-  if Files.has_flow_ext filename then
-    (* We have Foo.js.flow in common code.
-
-       1. If we have also have Foo.js in common code:
-         a. We have Foo.js.flow or Foo.js in web code.
-            This is not good, but we will complain anyways from Foo.js in common code.
-         b. Nothing in web code. We are good
-       2. If we don't have Foo.js in common code:
-         a. We have Foo.js.flow or Foo.js in web code.
-            This can be tolerated, because the Foo.js.flow file can act as common interface file.
-         b. Nothing in web code. We are good.
-
-       Therefore, in all possible cases, we don't have to emit an error.
-    *)
-    ()
-  else
-    (* We have Foo.js in common code.
-     * We should error if we want Foo.js or Foo.js.flow in web only code. *)
-    match Files.haste_name_opt ~options:file_options filename with
+  match Files.haste_name_opt ~options:file_options filename with
+  | None -> ()
+  | Some haste_name ->
+    (match
+       let opts = metadata.Context.haste_namespaces_options in
+       Flow_projects.projects_bitset_of_path ~opts (File_key.to_string filename)
+       |> Base.Option.bind
+            ~f:(Flow_projects.individual_projects_bitsets_from_common_project_bitset ~opts)
+     with
     | None -> ()
-    | Some haste_name ->
-      (match
-         let opts = metadata.Context.haste_namespaces_options in
-         Flow_projects.projects_bitset_of_path ~opts (File_key.to_string filename)
-         |> Base.Option.bind
-              ~f:(Flow_projects.individual_projects_bitsets_from_common_project_bitset ~opts)
-       with
-      | None -> ()
-      | Some projects ->
+    | Some projects ->
+      let pos = Loc.{ line = 1; column = 0 } in
+      let loc_of_file f = Loc.{ source = Some f; start = pos; _end = pos } |> ALoc.of_loc in
+      let add_duplicate_provider_error platform_specific_provider_file =
+        Flow_js_utils.add_output
+          cx
+          (Error_message.EDuplicateModuleProvider
+             {
+               module_name = haste_name;
+               conflict = loc_of_file filename;
+               provider = loc_of_file platform_specific_provider_file;
+             }
+          )
+      in
+      if
+        (* Suppose we have the setup of web project, native project, and web+native common code project.
+         * We want to emit the same kinds of Haste module provider conflict error as if the same set of
+         * code is covered by two flowconfigs.
+         * (one include web only + common, one include native only + common) *)
+        Files.has_flow_ext filename
+      then
+        (* We have Foo.js.flow in common code.
+
+           1. If we have also have Foo.js in common code:
+             a. We have Foo.js.flow or Foo.js in web code.
+                This is not good, but we will complain anyways from Foo.js in common code.
+             b. Nothing in web code. We are good
+           2. If we don't have Foo.js in common code:
+             a. We have Foo.js.flow or Foo.js in web code.
+                This can be tolerated, because the Foo.js.flow file can act as common interface file.
+             b. Nothing in web code. We are good.
+
+           Therefore, in all possible cases, we don't have to emit an error.
+        *)
+        Base.List.iter projects ~f:(fun project ->
+            match
+              Context.find_require
+                cx
+                (Flow_import_specifier.HasteImportWithSpecifiedNamespace
+                   { namespace = Flow_projects.to_bitset project; name = haste_name }
+                )
+            with
+            | Context.MissingModule ->
+              (* There is no corresponding implementation file. This is allowed. *)
+              ()
+            | Context.UncheckedModule platform_specific_provider_module_loc ->
+              (* If the corresponding platform specific file is untyped, then we assume it satisfies
+               * the common interface. However, we do need to make sure that it's not another
+               * .js.flow file *)
+              let platform_specific_provider_file =
+                Base.Option.value_exn (ALoc.source platform_specific_provider_module_loc)
+              in
+              if Files.has_flow_ext platform_specific_provider_file then
+                add_duplicate_provider_error platform_specific_provider_file
+            | Context.TypedModule f ->
+              (match f () with
+              | Error t ->
+                (* Similar to the case above,
+                 * but in this case the module is any typed instead of untyped. *)
+                let platform_specific_provider_file =
+                  Base.Option.value_exn (ALoc.source (TypeUtil.loc_of_t t))
+                in
+                if Files.has_flow_ext platform_specific_provider_file then
+                  add_duplicate_provider_error platform_specific_provider_file
+              | Ok platform_specific_module_type ->
+                let open Type in
+                let get_exports_t ~is_common_interface_module reason m =
+                  (* For conformance test, we only care about the value part *)
+                  let (values_t, _) =
+                    Flow_js_utils.ImportModuleNsTKit.on_ModuleT
+                      cx
+                      ~is_common_interface_module
+                      (reason, false)
+                      m
+                  in
+                  values_t
+                in
+                let (self_sig_loc, self_module_type) =
+                  Module_info_analyzer.analyze_program cx tast
+                in
+                let prog_aloc = fst tast in
+                let interface_t =
+                  let reason = Reason.(mk_reason (RCustom "common interface") (fst tast)) in
+                  get_exports_t ~is_common_interface_module:true reason self_module_type
+                in
+                let platform_specific_t =
+                  get_exports_t
+                    ~is_common_interface_module:false
+                    platform_specific_module_type.Type.module_reason
+                    platform_specific_module_type
+                in
+                (* We need to fully resolve the type to prevent tvar widening. *)
+                Tvar_resolver.resolve cx interface_t;
+                Tvar_resolver.resolve cx platform_specific_t;
+                let use_op =
+                  Op (ConformToCommonInterface { self_sig_loc; self_module_loc = prog_aloc })
+                in
+                Flow_js.flow cx (platform_specific_t, UseT (use_op, interface_t)))
+        )
+      else
+        (* We have Foo.js in common code.
+         * We should error if we want Foo.js or Foo.js.flow in web only code. *)
         Base.List.iter projects ~f:(fun project ->
             let platform_specific_provider_module_loc =
               match
@@ -540,19 +619,7 @@ let check_haste_provider_conflict cx =
                 let platform_specific_provider_file =
                   Base.Option.value_exn (ALoc.source platform_specific_provider_module_loc)
                 in
-                let pos = Loc.{ line = 1; column = 0 } in
-                let loc_of_file f =
-                  Loc.{ source = Some f; start = pos; _end = pos } |> ALoc.of_loc
-                in
-                Flow_js_utils.add_output
-                  cx
-                  (Error_message.EDuplicateModuleProvider
-                     {
-                       module_name = haste_name;
-                       conflict = loc_of_file filename;
-                       provider = loc_of_file platform_specific_provider_file;
-                     }
-                  )
+                add_duplicate_provider_error platform_specific_provider_file
             )
         ))
 
@@ -913,7 +980,8 @@ let post_merge_checks cx ast tast metadata =
   force_lazy_tvars cx;
   check_react_rules cx tast;
   if not (Context.is_lib_file cx) then (
-    if (Context.metadata cx).Context.haste_namespaces_enabled then check_haste_provider_conflict cx;
+    if (Context.metadata cx).Context.haste_namespaces_enabled then
+      check_haste_provider_conflict cx tast;
     check_multiplatform_conformance cx ast tast
   );
   check_polarity cx;
