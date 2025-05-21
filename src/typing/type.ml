@@ -1093,8 +1093,6 @@ module rec TypeTerm : sig
   and react_effect_type =
     | HookDecl of ALoc.id
     | HookAnnot
-    | IdempotentEffect
-    | ParametricEffect of int
     | ArbitraryEffect
     | AnyEffect
 
@@ -1516,7 +1514,7 @@ module rec TypeTerm : sig
      * exact return type for calls to require(). This slot doesn't apply to pure
      * ES modules.
      *)
-    cjs_export: t option;
+    cjs_export: (ALoc.t option (* def_loc *) * t) option;
     (*
      * Sometimes we claim the module exports any or Object, implying that it
      * has every named export

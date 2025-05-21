@@ -987,8 +987,6 @@ module Make (I : INPUT) : S = struct
         | T.HookDecl _ ->
           Ty.Hook
         | T.ArbitraryEffect -> Ty.Arbitrary
-        | T.IdempotentEffect -> Ty.Idempotent
-        | T.ParametricEffect n -> Ty.Parametric n
         | T.AnyEffect -> Ty.Arbitrary (* TODO do we need an any-ful ty rep? *)
       in
       let%bind fun_params = mapM (fun_param ~env) params in
@@ -2047,7 +2045,7 @@ module Make (I : INPUT) : S = struct
       let open Type in
       let from_cjs_export ~env = function
         | None -> return None
-        | Some exports ->
+        | Some (_def_loc, exports) ->
           (match Lookahead.peek (Env.get_cx env) exports with
           | Lookahead.LowerBounds [DefT (_, ObjT o)] ->
             let%map (_, default) = module_of_object ~env o in
